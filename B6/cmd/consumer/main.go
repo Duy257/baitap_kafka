@@ -7,6 +7,7 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
     "log"
     "os"
@@ -19,8 +20,12 @@ import (
     "github.com/IBM/sarama"
 )
 
+const dlqTopic = "orders-dlq"
+
+var errMaxRetriesExceeded = errors.New("max retries exceeded, send to DLQ")
+
 // retryMap lưu số lần retry của từng message (key = nội dung message).
-// Dùng để giả lập: sau 3 lần retry, DB "hồi phục" và message được xử lý thành công.
+// Dùng để giả lập: sau 3 lần retry, message bị đẩy vào DLQ.
 // Lưu ý: đây là bộ nhớ trong, mất khi restart -> consumer sẽ retry lại từ đầu.
 var (
     mu       sync.Mutex
@@ -29,8 +34,9 @@ var (
 
 // processMessage xử lý một message từ Kafka, giả lập ghi vào database.
 // - Nếu message là số lẻ: luôn thành công.
-// - Nếu message là số chẵn: retry tối đa 3 lần, lần thứ 4 thành công.
+// - Nếu message là số chẵn: retry tối đa 3 lần, lần thứ 4 vào DLQ.
 // Trả về nil nếu xử lý thành công, error nếu thất bại (cần retry).
+// Trả về errMaxRetriesExceeded nếu quá số lần retry cho phép.
 func processMessage(msg *sarama.ConsumerMessage) error {
     // Chuyển []byte thành string để xử lý
     msgStr := string(msg.Value)
@@ -57,8 +63,9 @@ func processMessage(msg *sarama.ConsumerMessage) error {
         if retries <= 3 {
             return fmt.Errorf("DB error for message %d (retry %d)", num, retries)
         }
-        // Lần thứ 4: DB hồi phục, cho phép xử lý thành công
-        log.Printf("Message %d: DB recovered after %d retries", num, retries)
+        // Lần thứ 4: quá số lần retry, chuyển sang DLQ
+        log.Printf("Message %d: max retries (%d) exceeded, moving to DLQ", num, retries)
+        return fmt.Errorf("%w: message %d", errMaxRetriesExceeded, num)
     }
 
     log.Printf("Processed successfully: %s", msg.Value)
@@ -68,8 +75,9 @@ func processMessage(msg *sarama.ConsumerMessage) error {
 // ConsumerHandler implement sarama.ConsumerGroupHandler để xử lý message theo consumer group.
 // Các phương thức: Setup, Cleanup, ConsumeClaim.
 type ConsumerHandler struct {
-    ctx   context.Context // context để kiểm tra signal dừng trong retry loop
-    ready chan bool       // báo hiệu consumer group đã sẵn sàng
+    ctx         context.Context        // context để kiểm tra signal dừng trong retry loop
+    ready       chan bool              // báo hiệu consumer group đã sẵn sàng
+    dlqProducer sarama.SyncProducer    // producer gửi message vào DLQ sau 3 lần retry
 }
 
 // Setup được gọi khi consumer group bắt đầu session (sau join group, trước khi nhận partition).
@@ -109,6 +117,22 @@ func (c *ConsumerHandler) ConsumeClaim(session sarama.ConsumerGroupSession, clai
                 // MarkMessage đánh dấu offset trong bộ nhớ (chưa commit ngay)
                 session.MarkMessage(msg, "")
                 // Commit() đẩy offset đã mark lên Kafka ngay lập tức (đồng bộ)
+                session.Commit()
+                break retryLoop
+            } else if errors.Is(err, errMaxRetriesExceeded) {
+                // Quá số lần retry: gửi message vào DLQ, commit offset để không xử lý lại
+                dlqMsg := &sarama.ProducerMessage{
+                    Topic: dlqTopic,
+                    Key:   sarama.ByteEncoder(msg.Key),
+                    Value: sarama.ByteEncoder(msg.Value),
+                }
+                _, _, dlqErr := c.dlqProducer.SendMessage(dlqMsg)
+                if dlqErr != nil {
+                    log.Printf("Failed to send to DLQ: %v", dlqErr)
+                } else {
+                    log.Printf("Sent to DLQ: %s", msg.Value)
+                }
+                session.MarkMessage(msg, "")
                 session.Commit()
                 break retryLoop
             } else {
@@ -159,11 +183,25 @@ func main() {
         }
     }()
 
+    // Tạo producer riêng để gửi message vào DLQ
+    dlqConfig := sarama.NewConfig()
+    dlqConfig.Producer.RequiredAcks = sarama.WaitForAll
+    dlqConfig.Producer.Return.Successes = true
+    dlqProducer, err := sarama.NewSyncProducer(broker, dlqConfig)
+    if err != nil {
+        log.Fatalf("Tạo DLQ producer lỗi: %v", err)
+    }
+    defer func() {
+        if err := dlqProducer.Close(); err != nil {
+            log.Printf("Lỗi đóng DLQ producer: %v", err)
+        }
+    }()
+
     // Context dùng để cancel consumer group khi nhận Ctrl+C
     ctx, cancel := context.WithCancel(context.Background())
 
-    // Tạo handler chứa context và channel ready
-    handler := &ConsumerHandler{ctx: ctx, ready: make(chan bool)}
+    // Tạo handler chứa context, ready channel và DLQ producer
+    handler := &ConsumerHandler{ctx: ctx, ready: make(chan bool), dlqProducer: dlqProducer}
 
     // Goroutine riêng để chạy consumer group vòng lặp
     // Khi Consume trả về (rebalance hoặc lỗi), nếu context chưa cancel thì chạy lại
